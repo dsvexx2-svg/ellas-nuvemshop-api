@@ -11,26 +11,31 @@ export default async function handler(req, res) {
       });
     }
 
-    const { page = "1", per_page = "30" } = req.query;
+    const page = String(req.query.page ?? "1").trim();
+    const per_page = String(req.query.per_page ?? "30").trim();
 
-    const url = `https://api.nuvemshop.com.br/v1/${userId}/products?page=${page}&per_page=${per_page}`;
+    const url = `https://api.nuvemshop.com.br/v1/${userId}/products?page=${encodeURIComponent(
+      page
+    )}&per_page=${encodeURIComponent(per_page)}`;
 
     const response = await fetch(url, {
       headers: {
-        Authentication: `bearer ${token}`,
+        // Nuvemshop usa "Authentication: bearer <token>" (como você já está usando)
+        Authentication: `bearer ${String(token).trim()}`,
         "Content-Type": "application/json",
         "User-Agent": "ellas-nuvemshop-api (Vercel)",
       },
     });
 
-    const text = await response.text();
+    const rawText = await response.text();
+
     let data;
     try {
-      data = JSON.parse(text);
+      data = JSON.parse(rawText);
     } catch {
       return res.status(500).json({
         error: "Resposta inválida (não-JSON) da Nuvemshop",
-        raw: text?.slice?.(0, 1000) ?? text,
+        raw: rawText?.slice?.(0, 1000) ?? rawText,
       });
     }
 
@@ -41,59 +46,85 @@ export default async function handler(req, res) {
       });
     }
 
-    // ✅ Garantir que é array
+    // A API de produtos retorna array
     const products = Array.isArray(data) ? data : [];
 
-    // ✅ “Enxugar” para o FlutterFlow (sem quebrar imagem)
+    // Helpers de limpeza
+    const cleanString = (v) =>
+      v == null ? "" : String(v).replace(/\s+/g, " ").trim();
+
+    const cleanUrl = (v) => {
+      let s = cleanString(v);
+
+      // remove colchetes e aspas se vierem colados (ex: "[https://...]" ou "\"https://...\"")
+      s = s.replace(/^\[+/, "").replace(/\]+$/, "");
+      s = s.replace(/^"+/, "").replace(/"+$/, "");
+      s = s.replace(/^'+/, "").replace(/'+$/, "");
+
+      // valida esquema
+      if (!/^https?:\/\//i.test(s)) return "";
+      return s;
+    };
+
+    const pickName = (p) => {
+      const n = p?.name;
+      if (!n) return "";
+      if (typeof n === "string") return cleanString(n);
+      // tenta PT primeiro
+      return cleanString(n.pt || n["pt-BR"] || n.es || n.en || "");
+    };
+
+    const sumStock = (variant) => {
+      if (!Array.isArray(variant?.inventory_levels)) return null;
+      return variant.inventory_levels.reduce((acc, it) => {
+        const s = Number(it?.stock);
+        return acc + (Number.isFinite(s) ? s : 0);
+      }, 0);
+    };
+
     const mapped = products.map((p) => {
-      const name =
-        (p?.name && (p.name.pt || p.name["pt-BR"] || p.name.es || p.name.en)) ||
-        "";
+      const name = pickName(p);
 
       const firstVariant = p?.variants?.[0] ?? null;
 
-      // preços geralmente vêm como string, mas garantimos string
-      const price = firstVariant?.price != null ? String(firstVariant.price) : "";
+      const price =
+        firstVariant?.price != null ? cleanString(firstVariant.price) : "";
+
       const promotional_price =
         firstVariant?.promotional_price != null
-          ? String(firstVariant.promotional_price)
+          ? cleanString(firstVariant.promotional_price)
           : "";
 
-      // ✅ Nunca quebra: se não tiver imagem, vira ""
-      const image_url = p?.images?.[0]?.src ? String(p.images[0].src) : "";
+      // ✅ pega imagem e "higieniza"
+      const image_url = cleanUrl(p?.images?.[0]?.src);
 
-      // link do produto na loja (quando existir)
-      const productUrl = p?.canonical_url ? String(p.canonical_url) : "";
+      // ✅ url do produto e "higieniza"
+      const productUrl = cleanUrl(p?.canonical_url);
 
-      // estoque simples (somatório do primeiro variant, se existir)
-      // obs: inventory_levels pode não vir sempre
-      let stock = null;
-      if (Array.isArray(firstVariant?.inventory_levels)) {
-        stock = firstVariant.inventory_levels.reduce((acc, it) => {
-          const s = Number(it?.stock);
-          return acc + (Number.isFinite(s) ? s : 0);
-        }, 0);
-      }
+      const stock = sumStock(firstVariant);
 
       return {
         id: p?.id ?? null,
         name,
         price,
         promotional_price,
-        image_url,
+        image_url, // ✅ sem espaços/colchetes/aspas e sempre http(s) ou ""
         url: productUrl,
-        stock, // pode vir null
+        stock, // null ou número
       };
     });
 
     return res.status(200).json({
-      page: Number(page),
-      per_page: Number(per_page),
+      page: Number(page) || 1,
+      per_page: Number(per_page) || 30,
       count: mapped.length,
       products: mapped,
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Erro interno", message: String(err?.message || err) });
+    return res.status(500).json({
+      error: "Erro interno",
+      message: String(err?.message || err),
+    });
   }
 }
